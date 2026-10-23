@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tesseract · 4D</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,wght@0,300;1,300&family=Instrument+Sans:wght@400&display=swap" rel="stylesheet">
+<style>
+:root{
+  color-scheme: dark;
+  --bg:#06080d; --ink:#e9e4d8; --amber:#f0c98a; --aurora:#9fdcb8; --blue:#7fb8e0;
+  --pt:env(safe-area-inset-top,0px); --pb:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --bg:#06080d; --ink:#e9e4d8; } }
+:root[data-theme="dark"]{ --bg:#06080d; --ink:#e9e4d8; }
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--ink); overflow:hidden;
+  font-family:'Instrument Sans',system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased; touch-action:none;
+}
+#hero{position:fixed;inset:0;height:100svh;overflow:hidden}
+/* soft warmth behind the object so it isn't sitting in void */
+#hero::after{
+  content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+  background:
+    radial-gradient(40% 38% at 50% 50%, rgba(240,201,138,.08), transparent 72%),
+    radial-gradient(62% 56% at 50% 52%, rgba(159,220,184,.035), transparent 78%);
+}
+#galaxy{position:absolute;inset:0;width:100%;height:100%;z-index:0;
+  pointer-events:none;opacity:0;transition:opacity 1.6s ease}
+#galaxy.on{opacity:1}
+#cube{position:absolute;inset:0;width:100%;height:100%;z-index:2;cursor:grab;display:block}
+#cube.drag{cursor:grabbing}
+
+.ui{position:fixed;z-index:5;pointer-events:none;opacity:0;animation:in 1.8s .8s ease forwards}
+@keyframes in{to{opacity:1}}
+#mark{top:calc(20px + var(--pt));left:22px;font-family:'Newsreader',Georgia,serif;
+  font-weight:300;font-size:19px;letter-spacing:.02em;opacity:.8}
+#mark small{display:block;font-family:'Instrument Sans',sans-serif;font-size:8.5px;
+  letter-spacing:.26em;text-transform:uppercase;opacity:.55;margin-top:3px}
+#hud{left:22px;bottom:calc(20px + var(--pb));
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;letter-spacing:.13em;
+  color:rgba(233,228,216,.42)}
+#hint{right:22px;bottom:calc(20px + var(--pb));font-size:10px;letter-spacing:.1em;
+  color:rgba(233,228,216,.34);text-align:right;line-height:1.7}
+#hint b{font-weight:400;color:rgba(233,228,216,.6)}
+@media (max-width:640px){
+  #hint{display:none}
+  #hud{font-size:9px}
+}
+</style>
+</head>
+<body>
+<section id="hero">
+  <canvas id="galaxy" aria-hidden="true"></canvas>
+  <canvas id="cube"></canvas>
+</section>
+
+<div class="ui" id="mark">Tesseract<small>four dimensions</small></div>
+<div class="ui" id="hud">4D · 16V · 32E · 24F · 8C</div>
+<div class="ui" id="hint">
+  <b>scroll</b> zoom &nbsp; <b>drag</b> turn<br>
+  <b>click a corner</b> to go there &nbsp; <b>R</b> reset
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/*!
+ * galaxy.js — interactive WebGL spiral-galaxy background (three.js r128, UMD).
+ * Stars near the cursor/finger scatter + swirl, then ease back; drag spins it;
+ * optional tilt follows the pointer.
+ */
+(function (global) {
+  const THREE_URL = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+  const $ = s => (typeof s === 'string' ? document.querySelector(s) : s);
+  const load = src => new Promise((res, rej) => {
+    if (global.THREE) return res();
+    const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s);
+  });
+
+  const DEFAULTS = {
+    canvas: '#galaxy', area: null, anchor: null,
+    anchorScale: 1.05, radiusPx: 420,
+    count: 4200, countLow: 2200,
+    arms: 3, spin: 1.15, scatter: 0.55, thickness: 0.35,
+    tilt: { x: 1.05, z: -0.38 },
+    tiltFollow: 0.12,
+    rotateSpeed: 0.0009,
+    force: 1,
+    reach: 0.42,
+    colors: { inner: '#f0c98a', outer: '#9fdcb8', accent: '#7fb8e0' },
+    accentRatio: 0.08,
+    respectReducedMotion: true
+  };
+
+  function init(opts) {
+    const o = Object.assign({}, DEFAULTS, opts, { colors: Object.assign({}, DEFAULTS.colors, opts && opts.colors), tilt: Object.assign({}, DEFAULTS.tilt, opts && opts.tilt) });
+    const canvas = $(o.canvas); if (!canvas) return Promise.resolve(null);
+    if (o.respectReducedMotion && matchMedia('(prefers-reduced-motion: reduce)').matches) return Promise.resolve(null);
+    if (!document.createElement('canvas').getContext('webgl')) return Promise.resolve(null);
+    const area = $(o.area) || canvas.parentElement, anchor = $(o.anchor);
+    return load(THREE_URL).then(() => start(o, canvas, area, anchor)).catch(() => null);
+  }
+
+  function start(o, canvas, area, anchor) {
+    const THREE = global.THREE;
+    const low = (navigator.hardwareConcurrency || 4) <= 4 || innerWidth < 700;
+    const n = low ? o.countLow : o.count, R = 5;
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'low-power' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    camera.position.z = 14;
+
+    const pos = new Float32Array(n * 3), col = new Float32Array(n * 3), size = new Float32Array(n), phase = new Float32Array(n);
+    const ci = new THREE.Color(o.colors.inner), co = new THREE.Color(o.colors.outer), ca = new THREE.Color(o.colors.accent), c = new THREE.Color();
+    for (let i = 0; i < n; i++) {
+      const r = Math.pow(Math.random(), 1.6) * R, ang = (i % o.arms) / o.arms * Math.PI * 2 + r * o.spin;
+      const rnd = () => Math.pow(Math.random(), 3) * (Math.random() < .5 ? 1 : -1) * o.scatter * (r + .4);
+      pos.set([Math.cos(ang) * r + rnd(), rnd() * o.thickness, Math.sin(ang) * r + rnd()], i * 3);
+      c.copy(ci).lerp(co, r / R); if (Math.random() < o.accentRatio) c.copy(ca);
+      col.set([c.r, c.g, c.b], i * 3);
+      size[i] = Math.random() < .03 ? 3.2 : .6 + Math.random() * 1.4;
+      phase[i] = Math.random() * 6.283;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+    geo.setAttribute('aPhase', new THREE.BufferAttribute(phase, 1));
+
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexColors: true,
+      uniforms: { uMouse: { value: new THREE.Vector2(9, 9) }, uForce: { value: 0 }, uTime: { value: 0 }, uPR: { value: renderer.getPixelRatio() }, uAspect: { value: 1 }, uReach: { value: o.reach } },
+      vertexShader: `attribute float aSize; attribute float aPhase;
+        uniform vec2 uMouse; uniform float uForce,uTime,uPR,uAspect,uReach; varying vec3 vColor; varying float vAlpha;
+        void main(){ vec4 mv=modelViewMatrix*vec4(position,1.); vec4 clip=projectionMatrix*mv;
+          vec2 d=clip.xy/clip.w-uMouse; d.x*=uAspect; float dist=length(d);
+          float f=uForce*smoothstep(uReach,0.,dist); vec2 dir=dist>1e-4?d/dist:vec2(0.);
+          vec2 off=(dir*.16+vec2(-dir.y,dir.x)*.09)*f; off.x/=uAspect; clip.xy+=off*clip.w; gl_Position=clip;
+          gl_PointSize=aSize*uPR*(30./-mv.z)*(1.+f*.9); vColor=color*(1.+f*1.4);
+          vAlpha=(.55+.45*f)*(.72+.28*sin(uTime*1.8+aPhase)); }`,
+      fragmentShader: `varying vec3 vColor; varying float vAlpha;
+        void main(){ float r=length(gl_PointCoord-.5); float a=smoothstep(.5,0.,r); a*=a; gl_FragColor=vec4(vColor,a*vAlpha); }`
+    });
+    const stars = new THREE.Points(geo, mat), disk = new THREE.Group();
+    disk.add(stars); disk.rotation.set(o.tilt.x, 0, o.tilt.z); scene.add(disk);
+
+    let W = 1, H = 1, upp = 1;
+    const resize = () => { const r = canvas.getBoundingClientRect(); W = Math.max(1, r.width); H = Math.max(1, r.height);
+      renderer.setSize(W, H, false); camera.aspect = W / H; camera.updateProjectionMatrix();
+      mat.uniforms.uAspect.value = W / H; upp = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.position.z / H; };
+    resize(); addEventListener('resize', resize);
+    const place = () => { const cr = canvas.getBoundingClientRect();
+      let cx = cr.left + W / 2, cy = cr.top + H / 2, rad = o.radiusPx;
+      if (anchor) { const a = anchor.getBoundingClientRect(); cx = a.left + a.width / 2; cy = a.top + a.height / 2; rad = a.width * o.anchorScale; }
+      disk.position.set((cx - cr.left - W / 2) * upp, -(cy - cr.top - H / 2) * upp, 0); disk.scale.setScalar(rad * upp / R); };
+
+    const target = new THREE.Vector2(9, 9), mouse = mat.uniforms.uMouse.value, ptr = new THREE.Vector2();
+    let active = false, last = 0, dragX = null, spinV = 0;
+    const toNdc = (x, y) => { const r = canvas.getBoundingClientRect(); target.set((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height * 2 - 1)); ptr.copy(target); };
+    addEventListener('pointermove', e => { const r = area.getBoundingClientRect();
+      active = e.clientY >= r.top && e.clientY <= r.bottom; if (!active) return;
+      toNdc(e.clientX, e.clientY); last = performance.now();
+      if (dragX !== null) { spinV += (e.clientX - dragX) * 0.00012; dragX = e.clientX; } }, { passive: true });
+    area.addEventListener('pointerdown', e => { dragX = e.clientX; toNdc(e.clientX, e.clientY); active = true; last = performance.now(); });
+    addEventListener('pointerup', () => dragX = null); addEventListener('pointercancel', () => dragX = null);
+    area.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') active = false; });
+
+    let visible = true, raf = 0; const t0 = performance.now();
+    new IntersectionObserver(([en]) => { visible = en.isIntersecting; if (visible && !raf) raf = requestAnimationFrame(tick); }).observe(area);
+    function tick(now) { raf = 0; if (!visible) return;
+      mat.uniforms.uTime.value = (now - t0) / 1000; mouse.lerp(target, 0.12);
+      const want = active && now - last < 2500 ? o.force : 0; mat.uniforms.uForce.value += (want - mat.uniforms.uForce.value) * 0.06;
+      spinV *= 0.95; stars.rotation.y += o.rotateSpeed + spinV;
+      disk.rotation.x += (o.tilt.x - ptr.y * o.tiltFollow - disk.rotation.x) * 0.05;
+      disk.rotation.z += (o.tilt.z - ptr.x * o.tiltFollow - disk.rotation.z) * 0.05;
+      place(); renderer.render(scene, camera); raf = requestAnimationFrame(tick); }
+    raf = requestAnimationFrame(tick);
+    requestAnimationFrame(() => canvas.classList.add('on'));
+    return { renderer, scene, disk, stars, material: mat, destroy() { cancelAnimationFrame(raf); renderer.dispose(); geo.dispose(); mat.dispose(); } };
+  }
+
+  global.Galaxy = { init, DEFAULTS };
+})(window);
+
+/* ===========================================================================
+   The tesseract — a 4-cube.
+   16 vertices = (±1,±1,±1,±1) · 32 edges = pairs differing in one coordinate
+   24 square faces · 8 cubic cells.
+   Projected 4D → 3D by one perspective division on w, then drawn in 3D.
+   =========================================================================== */
+Galaxy.init({
+  canvas:'#galaxy', area:'#hero',
+  radiusPx: Math.min(innerWidth, innerHeight) * 0.78,
+  colors:{ inner:'#f0c98a', outer:'#9fdcb8', accent:'#7fb8e0' },
+  rotateSpeed:0.0006, reach:0.38
+});
+
+(function(){
+"use strict";
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+
+/* ---- the object in four dimensions ---- */
+const NV=16, D=4;
+const V4=[];
+for(let i=0;i<NV;i++){
+  const p=[];
+  for(let d=0;d<D;d++) p.push((i>>d & 1) ? 1 : -1);
+  V4.push(p);
+}
+const E=[];
+for(let i=0;i<NV;i++)
+  for(let d=0;d<D;d++){ const j=i^(1<<d); if(j>i) E.push([i,j]); }   // 32 edges
+
+/* ---- renderer on top of the galaxy, transparent background ---- */
+const canvas=document.getElementById('cube');
+const renderer=new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+renderer.setPixelRatio(Math.min(2, devicePixelRatio||1));
+renderer.setClearColor(0x000000, 0);
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.01, 200);
+cam.position.set(0,0,7);
+
+const obj=new THREE.Group();      // holds the projected cube; we move it to centre a corner
+scene.add(obj);
+
+/* vertices — soft dots, no glare */
+const dotTex=(function(){
+  const c=document.createElement('canvas'); c.width=c.height=64;
+  const g=c.getContext('2d'), gr=g.createRadialGradient(32,32,0,32,32,32);
+  gr.addColorStop(0,'rgba(255,250,238,.95)');
+  gr.addColorStop(0.22,'rgba(240,201,138,.45)');
+  gr.addColorStop(0.55,'rgba(240,201,138,.10)');
+  gr.addColorStop(1,'rgba(240,201,138,0)');
+  g.fillStyle=gr; g.fillRect(0,0,64,64);
+  const t=new THREE.CanvasTexture(c); t.needsUpdate=true; return t;
+})();
+const vPos=new Float32Array(NV*3), vCol=new Float32Array(NV*3), vSize=new Float32Array(NV);
+const vg=new THREE.BufferGeometry();
+vg.setAttribute('position',new THREE.BufferAttribute(vPos,3));
+vg.setAttribute('acol',new THREE.BufferAttribute(vCol,3));
+vg.setAttribute('asize',new THREE.BufferAttribute(vSize,1));
+const points=new THREE.Points(vg,new THREE.ShaderMaterial({
+  uniforms:{uMap:{value:dotTex},uDpr:{value:Math.min(2,devicePixelRatio||1)}},
+  vertexShader:`attribute vec3 acol; attribute float asize; varying vec3 vC; uniform float uDpr;
+    void main(){ vC=acol; vec4 mv=modelViewMatrix*vec4(position,1.);
+      gl_PointSize=asize*uDpr*(170.0/max(-mv.z,0.4)); gl_Position=projectionMatrix*mv; }`,
+  fragmentShader:`uniform sampler2D uMap; varying vec3 vC;
+    void main(){ vec4 s=texture2D(uMap,gl_PointCoord); gl_FragColor=vec4(vC,s.a); }`,
+  transparent:true, depthWrite:false, blending:THREE.AdditiveBlending
+}));
+points.frustumCulled=false;
+obj.add(points);
+
+/* edges — thin lines, gradient by 4th-dimension depth */
+const ePos=new Float32Array(E.length*2*3), eCol=new Float32Array(E.length*2*3);
+const eg=new THREE.BufferGeometry();
+eg.setAttribute('position',new THREE.BufferAttribute(ePos,3));
+eg.setAttribute('color',new THREE.BufferAttribute(eCol,3));
+const lines=new THREE.LineSegments(eg,new THREE.LineBasicMaterial({
+  vertexColors:true, transparent:true, opacity:0.75, depthWrite:false
+}));
+lines.frustumCulled=false;
+obj.add(lines);
+
+/* ---- state ---- */
+const K=0.42;                      // perspective depth constant on w
+let aXW=0.4, aZW=0.0, aXY=0.0;     // 4D rotation angles
+let rotX=0.18, rotY=-0.5;          // 3D view rotation (drag)
+let velX=0, velY=0;
+let zoom=1, zoomT=1;
+let focus=-1;                      // which corner we're zoomed to, -1 = whole object
+const focusPos=new THREE.Vector3(), focusCur=new THREE.Vector3();
+const proj=[];                     // projected 3D positions (pre-view-rotation)
+for(let i=0;i<NV;i++) proj.push(new THREE.Vector3());
+
+const C_IN=new THREE.Color('#fff4de'), C_MID=new THREE.Color('#f0c98a'), C_OUT=new THREE.Color('#9fdcb8');
+const tmpC=new THREE.Color();
+
+function build(){
+  const c1=Math.cos(aXW), s1=Math.sin(aXW);
+  const c2=Math.cos(aZW), s2=Math.sin(aZW);
+  const c3=Math.cos(aXY), s3=Math.sin(aXY);
+  for(let i=0;i<NV;i++){
+    let [x,y,z,w]=V4[i];
+    // rotate in the XW plane
+    let nx=x*c1-w*s1, nw=x*s1+w*c1; x=nx; w=nw;
+    // rotate in the ZW plane
+    let nz=z*c2-w*s2;  nw=z*s2+w*c2; z=nz; w=nw;
+    // a slow turn in XY so the 3D shape also moves
+    nx=x*c3-y*s3; const ny=x*s3+y*c3; x=nx; y=ny;
+
+    // 4D → 3D: one perspective division on w. Vertices with w toward you
+    // project outward (the "outer cube"); w away projects inward (the "inner cube").
+    const s=1/(1+K*w);
+    const X=x*s, Y=y*s, Z=z*s;
+    proj[i].set(X,Y,Z);
+    vPos[i*3]=X; vPos[i*3+1]=Y; vPos[i*3+2]=Z;
+
+    const t=clamp((w+1)/2,0,1);          // 0 = inner cube, 1 = outer cube
+    tmpC.copy(C_IN).lerp(C_MID,t).lerp(C_OUT, t*t*0.45);
+    const b=lerp(0.95,0.62,t);
+    vCol[i*3]=tmpC.r*b; vCol[i*3+1]=tmpC.g*b; vCol[i*3+2]=tmpC.b*b;
+    vSize[i]=lerp(2.6,1.7,t)*(focus===i?1.7:1);
+  }
+  for(let e=0;e<E.length;e++){
+    const [a,b]=E[e], o=e*6;
+    ePos[o]=vPos[a*3];   ePos[o+1]=vPos[a*3+1]; ePos[o+2]=vPos[a*3+2];
+    ePos[o+3]=vPos[b*3]; ePos[o+4]=vPos[b*3+1]; ePos[o+5]=vPos[b*3+2];
+    const lit=(focus===a||focus===b)?1.45:1.0;
+    eCol[o]=vCol[a*3]*lit;   eCol[o+1]=vCol[a*3+1]*lit; eCol[o+2]=vCol[a*3+2]*lit;
+    eCol[o+3]=vCol[b*3]*lit; eCol[o+4]=vCol[b*3+1]*lit; eCol[o+5]=vCol[b*3+2]*lit;
+  }
+  vg.attributes.position.needsUpdate=true;
+  vg.attributes.acol.needsUpdate=true;
+  vg.attributes.asize.needsUpdate=true;
+  eg.attributes.position.needsUpdate=true;
+  eg.attributes.color.needsUpdate=true;
+}
+
+/* ---- picking a corner: nearest projected vertex to the click ---- */
+const ndc=new THREE.Vector3();
+function pick(cx,cy){
+  const r=canvas.getBoundingClientRect();
+  const mx=((cx-r.left)/r.width)*2-1, my=-(((cy-r.top)/r.height)*2-1);
+  let best=-1, bd=0.085;                       // generous but not greedy
+  for(let i=0;i<NV;i++){
+    ndc.copy(proj[i]).applyMatrix4(obj.matrixWorld).project(cam);
+    const d=Math.hypot(ndc.x-mx, ndc.y-my);
+    if(d<bd){ bd=d; best=i; }
+  }
+  return best;
+}
+
+/* ---- input ---- */
+let dragging=false, lastX=0, lastY=0, moved=0;
+canvas.addEventListener('pointerdown',e=>{
+  dragging=true; lastX=e.clientX; lastY=e.clientY; moved=0;
+  canvas.classList.add('drag'); canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove',e=>{
+  if(!dragging) return;
+  const dx=e.clientX-lastX, dy=e.clientY-lastY;
+  lastX=e.clientX; lastY=e.clientY; moved+=Math.abs(dx)+Math.abs(dy);
+  velY+=dx*0.0045; velX+=dy*0.0045;
+});
+addEventListener('pointerup',e=>{
+  if(dragging && moved<6){
+    const i=pick(e.clientX,e.clientY);
+    if(i>=0){ focus=i; zoomT=clamp(zoomT*1.9, 0.3, 160); }
+    else { focus=-1; zoomT=clamp(zoomT*0.72, 0.3, 160); }
+  }
+  dragging=false; canvas.classList.remove('drag');
+});
+canvas.addEventListener('wheel',e=>{
+  e.preventDefault();
+  zoomT=clamp(zoomT*Math.exp(-e.deltaY*0.0014), 0.3, 160);
+},{passive:false});
+
+/* pinch */
+const pts=new Map(); let pinch0=0;
+canvas.addEventListener('pointerdown',e=>pts.set(e.pointerId,e));
+addEventListener('pointerup',e=>pts.delete(e.pointerId));
+addEventListener('pointercancel',e=>pts.delete(e.pointerId));
+canvas.addEventListener('pointermove',e=>{
+  if(pts.has(e.pointerId)) pts.set(e.pointerId,e);
+  if(pts.size===2){
+    const [a,b]=[...pts.values()];
+    const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+    if(pinch0) zoomT=clamp(zoomT*Math.pow(d/pinch0,0.8),0.3,160);
+    pinch0=d; dragging=false;
+  } else pinch0=0;
+});
+
+addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'){ velY+=0.06; e.preventDefault(); }
+  else if(e.key==='ArrowLeft'){ velY-=0.06; e.preventDefault(); }
+  else if(e.key==='ArrowUp'){ velX-=0.06; e.preventDefault(); }
+  else if(e.key==='ArrowDown'){ velX+=0.06; e.preventDefault(); }
+  else if(e.key==='+'||e.key==='='){ zoomT=clamp(zoomT*1.15,0.3,160); e.preventDefault(); }
+  else if(e.key==='-'||e.key==='_'){ zoomT=clamp(zoomT/1.15,0.3,160); e.preventDefault(); }
+  else if(e.key==='r'||e.key==='R'){ zoomT=1; focus=-1; rotX=0.18; rotY=-0.5; velX=velY=0; }
+});
+
+function resize(){
+  renderer.setPixelRatio(Math.min(2, devicePixelRatio||1));
+  renderer.setSize(innerWidth, innerHeight, false);
+  cam.aspect=innerWidth/innerHeight;
+  cam.fov = innerWidth<640 ? 52 : 45;
+  cam.position.z = innerWidth<640 ? 7.6 : 7;
+  cam.updateProjectionMatrix();
+}
+addEventListener('resize',resize);
+
+/* ---- loop ---- */
+const hud=document.getElementById('hud');
+let hidden=false, last=performance.now(), hudZ=-1;
+document.addEventListener('visibilitychange',()=>{hidden=document.hidden; last=performance.now();});
+
+function frame(now){
+  requestAnimationFrame(frame);
+  if(hidden){ last=now; return; }
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  const slow=RM?0.3:1;
+
+  aXW += 0.26*dt*slow;
+  aZW += 0.17*dt*slow;
+  aXY += 0.07*dt*slow;
+
+  rotY+=velY; rotX+=velX;
+  const decay=Math.pow(0.02,dt);
+  velX*=decay; velY*=decay;
+  rotX=clamp(rotX,-1.35,1.35);
+
+  build();
+
+  zoom=lerp(zoom,zoomT,1-Math.pow(0.006,dt));
+  obj.scale.setScalar(2.0*zoom);
+  obj.rotation.set(rotX,rotY,0);
+
+  /* centre the chosen corner so you can zoom right into it */
+  if(focus>=0) focusPos.copy(proj[focus]); else focusPos.set(0,0,0);
+  focusCur.lerp(focusPos, 1-Math.pow(0.02,dt));
+  points.position.copy(focusCur).multiplyScalar(-1);
+  lines.position.copy(focusCur).multiplyScalar(-1);
+
+  if(Math.abs(zoom-hudZ)>0.02){
+    hudZ=zoom;
+    hud.textContent='4D · 16V · 32E · 24F · 8C · ×'+zoom.toFixed(2)+(focus>=0?' · corner '+(focus+1)+'/16':'');
+  }
+
+  renderer.render(scene,cam);
+}
+resize(); build();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
